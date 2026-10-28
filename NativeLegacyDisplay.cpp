@@ -3,6 +3,8 @@
 // Reuse the unchanged original generic framebuffer implementation. Unknown
 // backend leaves stop; this class is not yet a published system display.
 #include "OriginalLegacyFramebufferABI.h"
+#include "NativeGOPWire.h"
+#include "NativeHalfCodes.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
@@ -12,6 +14,8 @@
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
 #include <pexpert/pexpert.h>
 extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
 extern "C" IOService *native_legacy_display_allocate(void);
@@ -36,7 +40,8 @@ extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes
 extern "C" void native_legacy_retirement_observed(IOService *);
 // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
 // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
-extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+// format: NGP_BGRX8888, or for a half-float surface NGP_RGBA16F_LINEAR / NGP_RGBA16F_ENCODED (the client converts it on the GPU).
+extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t format);
 // The compositor's swapped surfaces, for a display that fetches them itself: [0] distinct surfaces seen, [1] swaps checked; for the first four, at
 // [2 + 3 * k]: allocation bytes, physical segments, largest segment (KiB). The pages are wired for the count and released.
 extern "C" {volatile uint32_t native_legacy_surfaces[14];}
@@ -67,20 +72,66 @@ static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
 extern "C" void native_legacy_gpu_fallback_observed(int status);
 // Swaps retired when the GPU client took the frame (before its copy finished), and copies that then failed after such a retirement.
 extern "C" {volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
+// Swaps the family gave up on after waiting 5 s for them (cancelSwapsAfterTimeout).
+extern "C" {volatile uint64_t native_legacy_swap_timeouts;}
 // Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off). The original family sends the compositor's vsync message (type 5)
 // through native_legacy_vsync_notify, the unchanged original sender, but only a platform subclass calls it from the panel's vblank and
 // that subclass is not part of this port: without it the render server never saw a vsync. The GOP scanout has no vblank interrupt, so a
 // work-loop timer stands in for it while at least one client has vsync notifications enabled. Events: 0 armed, 1 sent, 2 idle (no client),
 // 3 late (deadline passed, cadence restarted), 4 started, 5 refresh properties reported at that rate.
 extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint64_t continuousTime,uint64_t interval);
+// The panel's refresh rate in Hz for the tick and the refresh properties below (0: none, the render server's own 1/60 s). By default
+// boot-arg sheng-vsync; a platform may answer otherwise (its display device's mode).
+extern "C" __attribute__((weak)) unsigned native_legacy_refresh_hz(void) {
+    unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));return hz;
+}
 // The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
 extern "C" bool native_legacy_set_refresh_properties(void *display);
 extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
 extern "C" uint64_t mach_continuous_time(void);
+extern "C" void flush_dcache64(addr64_t addr,unsigned count,int phys);
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
 // either way (no compression is implemented), so the bytes are the same.
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
     return (format==0x42475241 && !planes) || (format==0x26424741 && planes<=1);
+}
+// 64-bit RGBA half float ('RGhA', one plane): iPadOS 27's render server picks it for this panel's framebuffer once a Metal device renders
+// (every Metal frame was refused while only BGRA was taken). The copy converts it to the scanout's BGRA (convertHalfRows below).
+static inline bool nativeHalf(uint32_t format,uint32_t planes) {return format==0x52476841 && !planes;}
+static inline bool nativeScanoutFormat(uint32_t format,uint32_t planes) {return nativeBgra(format,planes) || nativeHalf(format,planes);}
+// One byte per positive half bit pattern (32768); negative values and NaNs give 0, values of 1.0 and above 255.
+static uint8_t *halfTable() {
+    static uint8_t *table;
+    if(table)return table;
+    uint8_t *made=static_cast<uint8_t *>(IOMalloc(32768));
+    if(!made)return nullptr;
+    unsigned mode=1;PE_parse_boot_argn("sheng-fb-half",&mode,sizeof(mode));
+    const uint16_t *thresholds=mode==2?native_half::kEncoded:native_half::kLinear;
+    unsigned code=0;
+    for(unsigned bits=0;bits<32768;++bits) {
+        while(code<255 && bits>=thresholds[code])++code;
+        made[bits]=(bits>=0x7c00)?(bits==0x7c00?255:0):uint8_t(code);
+    }
+    if(!__sync_bool_compare_and_swap(&table,(uint8_t *)nullptr,made))IOFree(made,32768);
+    return table;
+}
+// Rows of RGBA half floats to the scanout's BGRA rows (alpha opaque). Returns false when the table cannot be made or a row runs past either end.
+static bool convertHalfRows(volatile void *dst,uint64_t dstLength,uint64_t dstStride,const void *src,uint64_t srcLength,uint64_t srcStride,
+                            uint32_t width,uint32_t height) {
+    const uint8_t *table=halfTable();
+    if(!table || dstStride<uint64_t(width)*4 || srcStride<uint64_t(width)*8 || !height ||
+       dstStride*(height-1)+uint64_t(width)*4>dstLength || srcStride*(height-1)+uint64_t(width)*8>srcLength)return false;
+    for(uint32_t y=0;y<height;++y) {
+        const uint64_t *in=reinterpret_cast<const uint64_t *>(static_cast<const uint8_t *>(src)+srcStride*y);
+        volatile uint32_t *out=reinterpret_cast<volatile uint32_t *>(static_cast<volatile uint8_t *>(dst)+dstStride*y);
+        for(uint32_t x=0;x<width;++x) {
+            const uint64_t p=in[x];
+            const uint32_t r=uint32_t(p)&0xffff,g=uint32_t(p>>16)&0xffff,b=uint32_t(p>>32)&0xffff;
+            const uint32_t rv=(r&0x8000)?0:table[r],gv=(g&0x8000)?0:table[g],bv=(b&0x8000)?0:table[b];
+            out[x]=0xff000000u|(rv<<16)|(gv<<8)|bv;
+        }
+    }
+    return true;
 }
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
@@ -108,10 +159,17 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
-    // The swap of the frame the GPU client is copying already retired (boot-arg sheng-early-retire, default 1).
+    // The swap of the frame the GPU client is copying already retired (boot-arg sheng-early-retire, default 1). Retiring the offered
+    // swap releases the frame shown before it, whose copy has finished (transferred held this one back); the offered frame itself stays
+    // in use until the next swap retires, so the compositor never writes a frame the GPU is still reading.
     bool gpuRetired=false;
+    // How a half-float surface is encoded (boot-arg sheng-fb-half=2: values already sRGB-encoded), as the GPU client converts it.
+    static uint32_t halfOfferFormat() {
+        unsigned mode=1;PE_parse_boot_argn("sheng-fb-half",&mode,sizeof(mode));
+        return mode==2?NGP_RGBA16F_ENCODED:NGP_RGBA16F_LINEAR;
+    }
     // The refresh tick runs on the family's work loop, the loop of the command gate that registers and removes the vsync clients, so the
-    // client queue at +5592 never changes while the sender walks it.
+    // client queue (kLegacyVsyncClients) never changes while the sender walks it.
     IOTimerEventSource *vsyncTimer=nullptr;
     uint64_t vsyncInterval=0,vsyncNext=0;
     unsigned vsyncHz=0;
@@ -205,7 +263,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         native_legacy_direct[8]=native_legacy_direct[8]+1;
     }
     bool vsyncWanted() const {
-        const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
+        const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+kLegacyVsyncClients,sizeof(head));return head;
     }
     // Selector 72's registration of a vsync client ends in kickSwapQueue (slot 290), which arms the tick; the tick stops by itself once
     // the last client is removed.
@@ -227,7 +285,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
     }
     void startVsync() {
-        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        unsigned hz=native_legacy_refresh_hz();
         if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
         IOWorkLoop *loop=getWorkLoop();
         if(!loop)return;
@@ -267,19 +325,27 @@ public:
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
-    // The panel is already lit by the firmware's GOP framebuffer, which is the one thing the original code's power-state word (display+5840,
-    // the "powered" half of the state pair next to +5836) is meant to say; the platform subclass that normally writes it is not part of this
+    // The panel is already lit by the firmware's GOP framebuffer, which is the one thing the original code's power-state word (the "powered" word
+    // of the state pair) is meant to say; the platform subclass that normally writes it is not part of this
     // port, so without it the user client's wait (selector 6) answers kIOReturnBusy forever and the compositor never presents. This is the
-    // original state setter (virtual 354, the one the original code calls with this same request shape) with only the powered word named.
+    // original state setter (the virtual the original code calls with this same request shape) with only the powered word named.
     void announcePoweredByFirmware() {
-        struct StateRequest {uint32_t skipRequested,requested,skipPowered,powered;uint8_t changed;uint8_t pad[11];} request={1,0,0,1,1,{}};
-        typedef int (*Setter)(void *,StateRequest *,bool);
-        Setter setter=reinterpret_cast<Setter *>(*reinterpret_cast<void **>(this))[354];
-        setter(this,&request,false);
+        OriginalLegacyStateRequest request={1,0,0,1,1,{}};
+        applyStateRequest(&request,false);
     }
     bool start(IOService *provider) override {
         if(!startDisplay(provider))return false;
+        publishOneLayer();
         startVsync();startDirect();return true;
+    }
+    // CoreAnimation reads how many layers the display scans out from IOMFBNumLayers (MaxNumLayers). Without the property it may hand a
+    // full-screen layer (an app's Metal layer) to the display as a detached layer of its own, copied through the IOSurfaceAccelerator
+    // scaler, which does not exist here (backboardd aborts: "Failed to create IOSurfaceAccelerator"). This display scans out one layer.
+    void publishOneLayer() {
+        OSDictionary *layers=OSDictionary::withCapacity(1);
+        OSNumber *count=OSNumber::withNumber(1ULL,32);
+        if(layers && count && layers->setObject("MaxNumLayers",count))setProperty("IOMFBNumLayers",layers);
+        OSSafeReleaseNULL(count);OSSafeReleaseNULL(layers);
     }
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
@@ -318,7 +384,7 @@ public:
         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
         // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps its own
         // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when sheng-vsync asks for more.
-        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        unsigned hz=native_legacy_refresh_hz();
         if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
@@ -330,7 +396,7 @@ public:
     // variable refresh, so sheng-vsync-fixed=1 reports the maximum interval equal to the minimum: one fixed rate.
     bool getRefreshAttributes(uint64_t *words,bool fixed) override {
         if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
-        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        unsigned hz=native_legacy_refresh_hz();
         if(hz<=60 || hz>240)return true;
         unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
         const uint64_t interval=(1ull<<32)/hz;
@@ -368,7 +434,7 @@ public:
         // The separate original software-renderer experiment uses completed
         // synchronous CPU surfaces, with no GPU or display fence fabricated.
         OSObject *surface=nullptr;
-        memcpy(&surface,reinterpret_cast<const unsigned char *>(request)+2624,sizeof(surface));
+        memcpy(&surface,reinterpret_cast<const unsigned char *>(request)+kRequestSurfaces,sizeof(surface));
         if(!surface) {
             // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
             PE_Video blank={};
@@ -403,7 +469,7 @@ public:
         uint64_t allocation=native_legacy_surface_allocation(surface);
         if(!memory || !memory->metaCast("IOMemoryDescriptor") || !native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) ||
            native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
-           !nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
+           !nativeScanoutFormat(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
            PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
            video.v_width!=width || video.v_height!=height || video.v_depth!=32 || video.v_rotate ||
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
@@ -415,7 +481,8 @@ public:
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
         noteSurface(surface,memory);
-        if(directOn && !gpuBypass && !latchRequest) {
+        const bool half=nativeHalf(native_legacy_surface_format(surface),native_legacy_surface_planes(surface));
+        if(directOn && !half && !gpuBypass && !latchRequest) {
             const int slot=directSlot(surface,memory);
             if(slot>=0) {
                 native_legacy_swap_stage(1);
@@ -428,7 +495,7 @@ public:
             native_legacy_direct[7]=native_legacy_direct[7]+1;
         }
         directToBoot();
-        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
+        if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height,half?halfOfferFormat():NGP_BGRX8888)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
             shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
@@ -442,9 +509,26 @@ public:
             }
             return;
         }
-        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+        // Surfaces may be write-combined (iPadOS 27 display surfaces are): reading them uncached costs seconds per frame. Read through
+        // a cacheable view, after cleaning and invalidating it so lines from the previous frame are not reused.
+        IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
+        }
+        flush_dcache64((addr64_t)source->getVirtualAddress(),(unsigned)source->getLength(),false);
+        if(half) {
+            if(!native_legacy_prepare_scanout()) {OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
+            if(!convertHalfRows(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),bootMapping->getLength(),video.v_rowBytes,
+                reinterpret_cast<const void *>(source->getVirtualAddress()),source->getLength(),sourceStride,width,height)) {
+                OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+            }
+            __asm__ volatile("dsb sy" ::: "memory");
+            {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,length);}
+            shadowValid=false;OSSafeReleaseNULL(source);transferred=true;
+            native_legacy_transfer_observed(kIOReturnSuccess,request,length);
+            finishTransfer(request);
+            return;
         }
         if(!native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
@@ -538,6 +622,18 @@ public:
         transferred=false;
         kickSwapQueue();
     }
+#if defined(NATIVE_LEGACY_CANCEL_SWAPS) && NATIVE_LEGACY_CANCEL_SWAPS
+    // swap_wait_gated gives up on a swap that has not completed in 5 s ("CommandWake didn't happen even after 5 seconds ... cancelling
+    // swaps") and calls this first, then cancels its own queue. Forget the swaps this class tracks: a GPU copy that ends later finds no
+    // request (finishGpuSwap), a request the family cancelled is no longer its queue's head, so nothing completes twice and the next
+    // frame is not held behind the cancelled one. The family only logs the result; the slot used to be a guard that panicked.
+    bool cancelSwapsAfterTimeout() override {
+        native_legacy_swap_timeouts=native_legacy_swap_timeouts+1;
+        for(auto &entry: validated)entry=nullptr;
+        gpuRequest=nullptr;gpuRetired=false;transferred=false;
+        return true;
+    }
+#endif
     IOReturn collectCompletionReports(uint32_t,void *,uint32_t *count,uint32_t) override {
         // The original completion helper passes null optional outputs and
         // ignores this IOReturn. GOP exposes no hardware completion telemetry.
@@ -554,24 +650,24 @@ public:
         OSObject *surface=nullptr;unsigned reason=1;bool accepted=false;
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-validate",&enabled,sizeof(enabled));
         if(enabled==1 && logicalPM && primary && bootMapping && request) {
-            reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+2624,sizeof(surfaces));surface=surfaces[0];
+            reason=2;OSObject *surfaces[4]={};memcpy(surfaces,bytes+kRequestSurfaces,sizeof(surfaces));surface=surfaces[0];
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
             if(surface && surface->metaCast("IOSurface") && !surfaces[1] && !surfaces[2] && !surfaces[3] &&
-               native_legacy_single_layer_state(word(792),word(796),word(800))) {
+               native_legacy_single_layer_state(word(kRequestMasks),word(kRequestMasks+4),word(kRequestMasks+8))) {
                 reason=3;bool rectangles=true;
-                const unsigned rectOffsets[]={17,81};
+                const unsigned rectOffsets[]={kRequestRect0,kRequestRect1};
                 for(unsigned offset: rectOffsets) {
                     uint32_t rect[4]={};memcpy(rect,bytes+offset,sizeof(rect));
                     rectangles=rectangles && rect[0]==0 && rect[1]==0 && rect[2]==width && rect[3]==height;
                 }
-                bool options=true;for(unsigned offset=804;offset<=812;offset+=4)options=options && word(offset)==0;
-                if(width && height && rectangles && options && word(816)==width && word(820)==height) {
+                bool options=true;for(unsigned offset=kRequestOptions;offset<=kRequestOptions+8;offset+=4)options=options && word(offset)==0;
+                if(width && height && rectangles && options && word(kRequestDims)==width && word(kRequestDims+4)==height) {
                     reason=4;
                     IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
                     // A surface larger than the display (rows or lines padded to the GPU's alignment) is accepted: only the visible rectangle,
                     // which the request's rectangles already name as the whole display, is copied.
                     if(native_legacy_surface_width(surface)>=width && native_legacy_surface_height(surface)>=height &&
-                       nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) &&
+                       nativeScanoutFormat(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) &&
                        memory && memory->metaCast("IOMemoryDescriptor") &&
                        native_legacy_surface_bounds(width,height,native_legacy_surface_stride(surface),
                            native_legacy_surface_allocation(surface),memory->getLength())) {
@@ -586,11 +682,11 @@ public:
         }
         if(!accepted && reason==2 && !surface && enabled==1) {
             // No surface in any slot and every updated layer disabled over black: present a blank screen.
-            OSObject *none[4]={};memcpy(none,bytes+2624,sizeof(none));
+            OSObject *none[4]={};memcpy(none,bytes+kRequestSurfaces,sizeof(none));
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
-            bool options=true;for(unsigned offset=804;offset<=812;offset+=4)options=options && word(offset)==0;
+            bool options=true;for(unsigned offset=kRequestOptions;offset<=kRequestOptions+8;offset+=4)options=options && word(offset)==0;
             if(!none[0] && !none[1] && !none[2] && !none[3] && width && height && options &&
-               word(816)==width && word(820)==height && native_legacy_blank_state(word(792),word(796),word(800))) {
+               word(kRequestDims)==width && word(kRequestDims+4)==height && native_legacy_blank_state(word(kRequestMasks),word(kRequestMasks+4),word(kRequestMasks+8))) {
                 reason=5;accepted=true;
             }
         }
@@ -640,18 +736,16 @@ public:
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
+#if defined(NATIVE_LEGACY_DEFAULT_SURFACE) && NATIVE_LEGACY_DEFAULT_SURFACE
+                // The family calls its void slot 316 after startHardware. Our backend supplies the client's default surface.
+                if(valid)valid=installDefaultSurface(width,height);
+#endif
             }
         }
         OSSafeReleaseNULL(mapping);return valid;
     }
 #define LEAF(n) __attribute__((noreturn,noinline)) void opaque##n() override { native_legacy_backend_guard(n,this,__builtin_return_address(0)); }
-    LEAF(211)
-    LEAF(245)
-    LEAF(246)
-    LEAF(306)
-    LEAF(307)
-    LEAF(338)
-    LEAF(345)
+    NATIVE_LEGACY_LEAVES(LEAF)
 #undef LEAF
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)

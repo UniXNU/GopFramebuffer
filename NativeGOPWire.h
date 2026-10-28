@@ -2,7 +2,9 @@
 // Actual firmware scanout transfer, not a compositor or hardware vblank ABI.
 #pragma once
 #include <stdint.h>
-enum { NGP_BGRX8888=1,NGP_VERSION=1 };
+// Scanout format (NGPMode) and frame formats (NGPSwap.format). A half-float frame is RGBA 16F rows, converted to the scanout's BGRX by the
+// client on the GPU: LINEAR holds linear light (encoded to sRGB on the way), ENCODED holds values already sRGB-encoded.
+enum { NGP_BGRX8888=1,NGP_RGBA16F_LINEAR=2,NGP_RGBA16F_ENCODED=3,NGP_VERSION=1 };
 struct NGPMode {uint32_t version,format;uint64_t width,height,stride,bytes;};
 struct NGPPresent {uint64_t address,bytes;uint32_t width,height,stride,format;};
 struct NGPTransfer {uint64_t sequence,bytes;};

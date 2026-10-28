@@ -17,7 +17,7 @@ volatile uint64_t native_gop_gpu_offers,native_gop_gpu_completions,native_gop_gp
  * and [5] the longest such wait (ns), [6] total ns waited in timed-out calls. A timed wait that returns long before its deadline shows here. */
 volatile uint64_t native_gop_wait_stats[7];
 IOService *native_gop_presenter_create(void);
-bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t format);
 void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
 // Provided by the display driver: finishes (status 0) or fails the swap that was offered.
 void native_legacy_gpu_complete(void *display,int status);
@@ -37,7 +37,7 @@ class NativeGOPPresenter : public IOService {
     // GPU hand-off (sheng-fb-gpu=1): one offered frame at a time, from the display driver to the privileged client.
     bool gpuMode=false,gpuClient=false;
     struct {bool offered,delivered;uint64_t sequence;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;
-            uint64_t stride;uint32_t width,height;} swap={};
+            uint64_t stride;uint32_t width,height,format;} swap={};
     uint64_t swapSequence=0;
     IOReturn waitSwap(task_t,uint64_t timeoutMs,NGPSwap *);
     IOReturn completeSwap(uint64_t sequence,int status);
@@ -46,7 +46,7 @@ public:
     void setMemorySource(IOService *source) {memorySource=source;}
     static IOReturn handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize);
     static IOMemoryDescriptor *handoffMemory();
-    bool offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+    bool offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t format);
 private:
     IOReturn transfer(task_t,const NGPPresent &,NGPTransfer *);
 public:
@@ -128,13 +128,13 @@ IOReturn NativeGOPPresenter::transfer(task_t task,const NGPPresent &q,NGPTransfe
 }
 // The display driver offers a finished frame. Accepted only while the privileged GPU client is alive and waiting for work; otherwise the
 // display driver keeps its own path (counted by it as a fallback).
-bool NativeGOPPresenter::offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
+bool NativeGOPPresenter::offer(void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height,uint32_t format) {
     if(!gpuMode || !memory || !display || !gate)return false;
     IOLockLock(gate);
     bool accepted=online && gpuClient && !swap.offered;
     if(accepted) {
         memory->retain();
-        swap={true,false,++swapSequence,display,memory,nullptr,stride,width,height};
+        swap={true,false,++swapSequence,display,memory,nullptr,stride,width,height,format};
         native_gop_gpu_offers=native_gop_gpu_offers+1;
         IOLockWakeup(gate,&swap,false);
     }
@@ -162,7 +162,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     if(!online) {IOLockUnlock(gate);return kIOReturnNotReady;}
     swap.delivered=true;
     IOMemoryDescriptor *memory=swap.memory;memory->retain();
-    const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height;
+    const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height,format=swap.format;
     IOLockUnlock(gate);
     // The frame's pages go into the client's task here, writable like any import (the GPU maps them for reading; the kernel pins and maintains them).
     IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);
@@ -173,7 +173,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     }
     swap.map=map;
     out->sequence=sequence;out->address=map->getVirtualAddress();out->bytes=map->getLength();out->stride=stride;
-    out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=0;
+    out->width=width;out->height=height;out->format=format;out->reserved=0;
     IOLockUnlock(gate);return kIOReturnSuccess;
 }
 IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
@@ -201,9 +201,9 @@ void NativeGOPPresenter::abandonSwap() {
 extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub) {
     if(NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter))p->setMemorySource(nub);
 }
-extern "C" bool native_gop_gpu_offer(IOService *presenter,void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height) {
+extern "C" bool native_gop_gpu_offer(IOService *presenter,void *display,IOMemoryDescriptor *memory,uint64_t stride,uint32_t width,uint32_t height,uint32_t format) {
     NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter);
-    return p && p->offer(display,memory,stride,width,height);
+    return p && p->offer(display,memory,stride,width,height,format);
 }
 // Entry points for the GPU client that reaches the hand-off through an already admitted connection (the Adreno accelerator's user client, which
 // the original sandbox profiles allow where they do not allow this service): op 0 mode, 2 wait for a frame, 3 complete it (the NGP_METHOD_*
