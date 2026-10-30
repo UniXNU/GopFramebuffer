@@ -47,8 +47,12 @@ extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint6
 extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // Direct scanout (sheng-dpu-scanout=2): the display's two pipes fetch the compositor's surface through the display bank's window
 // (NativeUfs native_ufs_dpu_map). [0] flips, [1] surfaces mapped, [2] map failures, [3] latches that took over 50 ms, [4] longest latch (us),
-// [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory.
-extern "C" {volatile uint32_t native_legacy_direct[9];}
+// [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory,
+// [9] sampled checks of the surface on screen, [10] checks that found it changed, [11] rows changed in total, [12] swaps whose surface was the one
+// on screen, [13] swaps whose surface was the one shown before it, [14..18] first change of a shown surface by time since it latched (<2, <5,
+// <10, <20, >=20 ms), [19] swaps that submitted a surface that had been changed while shown (written, then handed back as a new frame).
+// [20] swaps retired by the next frame's latch, [21] retired by the 100 ms timeout, [22] retired because the next frame took the copy.
+extern "C" {volatile uint32_t native_legacy_direct[23];}
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
 static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
@@ -133,6 +137,9 @@ static bool convertHalfRows(volatile void *dst,uint64_t dstLength,uint64_t dstSt
     }
     return true;
 }
+class NativeLegacyDisplay;
+static NativeLegacyDisplay *gDirectDisplay=nullptr;
+extern "C" void native_legacy_direct_snapshot(void);
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
@@ -187,6 +194,21 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     const OriginalLegacySwapRequest *latchRequest=nullptr;
     uint64_t latchStart=0,directClock=0;
     int shownSlot=-1,pendingSlot=-1;
+    uint32_t shownStride=0;
+    int prevSlot=-1;
+    static constexpr unsigned kSampleRows=64;
+    uint32_t sampleRef[kSampleRows];   // no initializer: IOKit objects are allocated zeroed, and a member memset would push the constructor's call to the original C2 out of the binding check's window
+    bool sampleValid=false,changedThisShow=false;
+    bool changedSince[4];
+    // sheng-dpu-hold=1 (default off): the latch retires the swap before it, and the one just shown stays pending until the next frame is on
+    // screen (or 100 ms pass, or the next frame goes through the copy). It runs without stalls, but the compositor still writes into the surface
+    // on screen (97 of 285 first changes 2 to 5 ms after the latch, 95 handed back as new frames), so retire timing is not what picks the surface.
+    const OriginalLegacySwapRequest *held=nullptr;
+    uint64_t heldSince=0;
+    bool holdOn=false;
+    uint64_t shownSince=0;
+    IOTimerEventSource *watchTimer=nullptr;
+    uint8_t *sampleRow=nullptr;
     bool directOn=false,directBoot=true;
     static constexpr uint32_t kVig[2]={0x4000,0x6000},kCtlFlush=0x15018,kBootIova=0xb8000000U,kBootStride=0x2fa0;
     void startDirect() {
@@ -196,17 +218,79 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         mdpMap=memory?memory->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
         if(memory)memory->release();
         directPages=static_cast<uint64_t *>(IOMallocData(8192*sizeof(uint64_t)));
+        sampleRow=static_cast<uint8_t *>(IOMallocData(16384));
         IOWorkLoop *loop=getWorkLoop();
         latchTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::latchFired):nullptr;
-        if(!mdpMap || !directPages || !latchTimer || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
-            OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);
+        watchTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::watchFired):nullptr;
+        if(!mdpMap || !directPages || !sampleRow || !latchTimer || !watchTimer || loop->addEventSource(watchTimer)!=kIOReturnSuccess || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
+            OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);OSSafeReleaseNULL(watchTimer);
             if(directPages){IOFreeData(directPages,8192*sizeof(uint64_t));directPages=nullptr;}
+            if(sampleRow){IOFreeData(sampleRow,16384);sampleRow=nullptr;}
             return;
         }
         mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
-        directOn=true;
+        unsigned hold=0;PE_parse_boot_argn("sheng-dpu-hold",&hold,sizeof(hold));holdOn=hold!=0;
+        directOn=true;gDirectDisplay=this;
+    }
+    // The diagnostic screenshot reads the boot memory, which the display no longer scans: draw the surface on screen into it (rows of the
+    // visible width) so the picture shows what the panel shows.
+    friend void native_legacy_direct_snapshot(void);
+    void snapshot() {
+        if(!directOn || directBoot || shownSlot<0 || !bootMapping || !shownStride)return;
+        IOMemoryDescriptor *source=directSlots[shownSlot].memory;
+        PE_Video video={};uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+        if(!source || PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() || video.v_width!=width || video.v_height!=height)return;
+        uint8_t *out=reinterpret_cast<uint8_t *>(bootMapping->getVirtualAddress());
+        for(uint32_t y=0;y<height && uint64_t(y+1)*video.v_rowBytes<=bootMapping->getLength();++y)
+            if(source->readBytes(uint64_t(y)*shownStride,out+uint64_t(y)*video.v_rowBytes,uint64_t(width)*4)!=uint64_t(width)*4)return;
+    }
+    // Does anything write into the surface while it is on screen? Every 1/128th row of the shown surface is hashed when it latches and again
+    // before it is replaced (and when the next flip is asked for); a row that differs was written by the compositor or the GPU under the display.
+    bool sampleSurface(int slot,uint32_t *out) {
+        IOMemoryDescriptor *source=slot>=0?directSlots[slot].memory:nullptr;
+        uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+        if(!source || !sampleRow || !shownStride || !width || width*4>16384 || !height)return false;
+        for(unsigned i=0;i<kSampleRows;++i) {
+            const uint64_t y=uint64_t(i)*height/kSampleRows;
+            if(source->readBytes(y*shownStride,sampleRow,uint64_t(width)*4)!=uint64_t(width)*4)return false;
+            uint32_t h=2166136261u;
+            const uint32_t *w=reinterpret_cast<const uint32_t *>(sampleRow);
+            for(uint32_t k=0;k<width;++k)h=(h^w[k])*16777619u;
+            out[i]=h;
+        }
+        return true;
+    }
+    void checkShown() {
+        if(shownSlot<0 || !sampleValid)return;
+        uint32_t now[kSampleRows];
+        if(!sampleSurface(shownSlot,now))return;
+        unsigned changed=0;
+        for(unsigned i=0;i<kSampleRows;++i)if(now[i]!=sampleRef[i])++changed;
+        native_legacy_direct[9]=native_legacy_direct[9]+1;
+        if(!changed)return;
+        native_legacy_direct[10]=native_legacy_direct[10]+1;native_legacy_direct[11]=native_legacy_direct[11]+changed;
+        memcpy(sampleRef,now,sizeof now);
+        changedSince[shownSlot]=true;
+        if(!changedThisShow) {
+            changedThisShow=true;
+            uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-shownSince,&ns);
+            const uint64_t ms=ns/1000000;
+            const unsigned bucket=ms<2?14:ms<5?15:ms<10?16:ms<20?17:18;
+            native_legacy_direct[bucket]=native_legacy_direct[bucket]+1;
+        }
+    }
+    static void watchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->watchTick();}
+    // While a surface is on screen, look at it every 2 ms.
+    void watchTick() {
+        if(!directOn || directBoot || shownSlot<0)return;
+        checkShown();
+        uint64_t held_ns=0;
+        if(held && !latchRequest){absolutetime_to_nanoseconds(mach_absolute_time()-heldSince,&held_ns);}
+        if(held && !latchRequest && held_ns>=100000000ull){retireHeld(21,false);transferred=false;kickSwapQueue();}
+        watchTimer->setTimeoutUS(2000);
     }
     void flip(uint32_t iova,uint32_t stride) {
+        shownStride=stride;
         for(uint32_t vig:kVig){mdp[(vig+0x14)/4]=iova;mdp[(vig+0x24)/4]=stride&0xffff;}
         __asm__ volatile("dsb sy" ::: "memory");
         mdp[kCtlFlush/4]=0x3;
@@ -243,6 +327,13 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         native_legacy_direct[1]=native_legacy_direct[1]+1;
         return pick;
     }
+    // Completes the frame kept pending (counter slot says why); the caller decides whether to kick the queue.
+    void retireHeld(unsigned counter,bool) {
+        if(!held)return;
+        const OriginalLegacySwapRequest *request=held;held=nullptr;
+        retireSwap(request,true);
+        native_legacy_direct[counter]=native_legacy_direct[counter]+1;
+    }
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
     void latchTick() {
         if(!latchRequest)return;
@@ -252,9 +343,18 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const uint32_t us=uint32_t(ns/1000);
         if(us>native_legacy_direct[4])native_legacy_direct[4]=us;
         native_legacy_direct[5]=native_legacy_direct[5]+us;
+        checkShown();
+        if(pendingSlot!=shownSlot)prevSlot=shownSlot;
         shownSlot=pendingSlot;pendingSlot=-1;
+        sampleValid=sampleSurface(shownSlot,sampleRef);
+        changedThisShow=false;if(shownSlot>=0)changedSince[shownSlot]=false;
+        shownSince=mach_absolute_time();watchTimer->setTimeoutUS(2000);
         const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
-        finishTransfer(request,true);
+        if(holdOn) {
+            retireHeld(20,false);
+            held=request;heldSince=mach_absolute_time();
+            transferred=false;kickSwapQueue();
+        } else finishTransfer(request,true);
     }
     // Back to the boot loader's memory (the blank frame and the copy are drawn there).
     void directToBoot() {
@@ -319,7 +419,8 @@ public:
     void stop(IOService *provider) override {
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
-        directToBoot();latchRequest=nullptr;pendingSlot=-1;
+        directToBoot();latchRequest=nullptr;pendingSlot=-1;held=nullptr;
+        if(watchTimer){watchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(watchTimer);OSSafeReleaseNULL(watchTimer);}
         if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
         directOn=false;
         if(logicalPM){PMstop();logicalPM=false;}
@@ -425,6 +526,11 @@ public:
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
+        // The head is the frame on screen, kept pending on purpose: the next frame is another accepted request.
+        if(held && request==held) {
+            request=nullptr;
+            for(auto entry: validated)if(entry && entry!=held){request=entry;break;}
+        }
         if(!request || !isValidated(request))return;
         // This bounded first-frame transfer preserves the original queue's
         // resource ownership. Separately gated retirement follows the copy;
@@ -436,6 +542,7 @@ public:
         OSObject *surface=nullptr;
         memcpy(&surface,reinterpret_cast<const unsigned char *>(request)+kRequestSurfaces,sizeof(surface));
         if(!surface) {
+            retireHeld(22,false);
             // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
             PE_Video blank={};
             uint32_t bw=0,bh=0;getDisplayDimensions(&bw,&bh);
@@ -483,8 +590,12 @@ public:
         noteSurface(surface,memory);
         const bool half=nativeHalf(native_legacy_surface_format(surface),native_legacy_surface_planes(surface));
         if(directOn && !half && !gpuBypass && !latchRequest) {
+            checkShown();
             const int slot=directSlot(surface,memory);
             if(slot>=0) {
+                if(changedSince[slot]){native_legacy_direct[19]=native_legacy_direct[19]+1;changedSince[slot]=false;}
+                if(slot==shownSlot)native_legacy_direct[12]=native_legacy_direct[12]+1;
+                else if(slot==prevSlot)native_legacy_direct[13]=native_legacy_direct[13]+1;
                 native_legacy_swap_stage(1);
                 flip(directSlots[slot].iova,uint32_t(sourceStride));directBoot=false;
                 native_legacy_direct[0]=native_legacy_direct[0]+1;
@@ -494,6 +605,7 @@ public:
             }
             native_legacy_direct[7]=native_legacy_direct[7]+1;
         }
+        retireHeld(22,false);
         directToBoot();
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height,half?halfOfferFormat():NGP_BGRX8888)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
@@ -749,5 +861,6 @@ public:
 #undef LEAF
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
+extern "C" void native_legacy_direct_snapshot(void) {if(gDirectDisplay)gDirectDisplay->snapshot();}
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
