@@ -52,7 +52,18 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // on screen, [13] swaps whose surface was the one shown before it, [14..18] first change of a shown surface by time since it latched (<2, <5,
 // <10, <20, >=20 ms), [19] swaps that submitted a surface that had been changed while shown (written, then handed back as a new frame).
 // [20] swaps retired by the next frame's latch, [21] retired by the 100 ms timeout, [22] retired because the next frame took the copy.
-extern "C" {volatile uint32_t native_legacy_direct[23];}
+// [23..26] sampled rows of the new surface equal to the one on screen, when that one had not changed since it latched (63+, 48+, 16+, fewer of
+// 64), [27..30] the same when it had.
+// [35] changes found while GPU fences were outstanding, [36] with none outstanding, [37] changes counted.
+// [31] swaps held back until the GPU had written the frame (the compositor submits the swap when the command buffer is scheduled), [32] total
+// and [33] longest wait (us), [34] waits that gave up after 250 ms.
+extern "C" {volatile uint32_t native_legacy_direct[38];}
+extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired) __attribute__((weak_import));
+// A slice of the direct scanout's event order (events 400 to 495 of the run): microseconds (28 bits) << 4 | type << 2 | slot, type 0 a swap
+// handed to the display (flip), 1 a latch, 2 a change found in the surface on screen.
+// The newest 160 events, frozen 64 events after the fifth first change of a shown surface; native_legacy_dcount counts them all.
+// native_legacy_dchg: the first 8 first changes, {microseconds (28 bits), slot, rows changed of 64, first and last changed row, GPU fences outstanding then}.
+extern "C" {volatile uint32_t native_legacy_dtrace[160];volatile uint32_t native_legacy_dcount;volatile uint64_t native_legacy_dphys[4];volatile uint32_t native_legacy_dchg[8][6];volatile uint32_t native_legacy_dfrozen;}
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
 static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
@@ -200,12 +211,19 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint32_t sampleRef[kSampleRows];   // no initializer: IOKit objects are allocated zeroed, and a member memset would push the constructor's call to the original C2 out of the binding check's window
     bool sampleValid=false,changedThisShow=false;
     bool changedSince[4];
+    unsigned freezeLeft=0,firstChanges=0;
     // sheng-dpu-hold=1 (default off): the latch retires the swap before it, and the one just shown stays pending until the next frame is on
     // screen (or 100 ms pass, or the next frame goes through the copy). It runs without stalls, but the compositor still writes into the surface
     // on screen (97 of 285 first changes 2 to 5 ms after the latch, 95 handed back as new frames), so retire timing is not what picks the surface.
     const OriginalLegacySwapRequest *held=nullptr;
     uint64_t heldSince=0;
     bool holdOn=false;
+    // The flip waits for the GPU (sheng-dpu-fence, default on): fenceFor is the request it waits for, fenceTarget the newest fence handed out when it arrived.
+    const OriginalLegacySwapRequest *fenceFor=nullptr;
+    uint32_t fenceTarget=0;
+    uint64_t fenceSince=0;
+    bool fenceOn=true;
+    IOTimerEventSource *fenceTimer=nullptr;
     uint64_t shownSince=0;
     IOTimerEventSource *watchTimer=nullptr;
     uint8_t *sampleRow=nullptr;
@@ -222,14 +240,16 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         IOWorkLoop *loop=getWorkLoop();
         latchTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::latchFired):nullptr;
         watchTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::watchFired):nullptr;
-        if(!mdpMap || !directPages || !sampleRow || !latchTimer || !watchTimer || loop->addEventSource(watchTimer)!=kIOReturnSuccess || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
-            OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);OSSafeReleaseNULL(watchTimer);
+        fenceTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::fenceFired):nullptr;
+        if(!mdpMap || !directPages || !sampleRow || !latchTimer || !watchTimer || loop->addEventSource(watchTimer)!=kIOReturnSuccess || !fenceTimer || loop->addEventSource(fenceTimer)!=kIOReturnSuccess || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
+            OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);OSSafeReleaseNULL(watchTimer);OSSafeReleaseNULL(fenceTimer);
             if(directPages){IOFreeData(directPages,8192*sizeof(uint64_t));directPages=nullptr;}
             if(sampleRow){IOFreeData(sampleRow,16384);sampleRow=nullptr;}
             return;
         }
         mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
         unsigned hold=0;PE_parse_boot_argn("sheng-dpu-hold",&hold,sizeof(hold));holdOn=hold!=0;
+        unsigned fence=1;PE_parse_boot_argn("sheng-dpu-fence",&fence,sizeof(fence));fenceOn=fence!=0;
         directOn=true;gDirectDisplay=this;
     }
     // The diagnostic screenshot reads the boot memory, which the display no longer scans: draw the surface on screen into it (rows of the
@@ -252,6 +272,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!source || !sampleRow || !shownStride || !width || width*4>16384 || !height)return false;
         for(unsigned i=0;i<kSampleRows;++i) {
             const uint64_t y=uint64_t(i)*height/kSampleRows;
+            // The display and the GPU write behind the CPU's caches: drop this row's lines first, or a line cached by the last sample hides
+            // (and later, once evicted, fakes) a change.
+            source->performOperation(kIOMemoryIncoherentIOFlush,y*shownStride,uint64_t(width)*4);
             if(source->readBytes(y*shownStride,sampleRow,uint64_t(width)*4)!=uint64_t(width)*4)return false;
             uint32_t h=2166136261u;
             const uint32_t *w=reinterpret_cast<const uint32_t *>(sampleRow);
@@ -260,17 +283,37 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         }
         return true;
     }
+    void trace(unsigned type,int slot) {
+        if(native_legacy_dfrozen)return;
+        const uint32_t n=native_legacy_dcount;native_legacy_dcount=n+1;
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+        native_legacy_dtrace[n%160]=(uint32_t((ns/1000)&0xfffffffu)<<4)|(type<<2)|(unsigned(slot)&3u);
+        if(freezeLeft && !--freezeLeft)native_legacy_dfrozen=1;
+    }
     void checkShown() {
         if(shownSlot<0 || !sampleValid)return;
         uint32_t now[kSampleRows];
         if(!sampleSurface(shownSlot,now))return;
-        unsigned changed=0;
-        for(unsigned i=0;i<kSampleRows;++i)if(now[i]!=sampleRef[i])++changed;
+        unsigned changed=0,firstRow=kSampleRows,lastRow=0;
+        for(unsigned i=0;i<kSampleRows;++i)if(now[i]!=sampleRef[i]){++changed;if(firstRow==kSampleRows)firstRow=i;lastRow=i;}
         native_legacy_direct[9]=native_legacy_direct[9]+1;
         if(!changed)return;
         native_legacy_direct[10]=native_legacy_direct[10]+1;native_legacy_direct[11]=native_legacy_direct[11]+changed;
         memcpy(sampleRef,now,sizeof now);
-        changedSince[shownSlot]=true;
+        changedSince[shownSlot]=true;trace(2,shownSlot);
+        {
+            uint32_t submitted=0,retired=0;
+            const bool known=&native_adreno_fences && native_adreno_fences(&submitted,&retired);
+            const uint32_t outstanding=known?uint32_t(int32_t(submitted-retired)>0?submitted-retired:0):0xffffu;
+            if(known){const unsigned at=outstanding?35:36;native_legacy_direct[at]=native_legacy_direct[at]+1;}
+            native_legacy_direct[37]=native_legacy_direct[37]+1;
+            if(!changedThisShow && firstChanges<8) {
+                uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+                volatile uint32_t *c=native_legacy_dchg[firstChanges];
+                c[0]=uint32_t((ns/1000)&0xfffffffu);c[1]=unsigned(shownSlot);c[2]=changed;c[3]=firstRow;c[4]=lastRow;c[5]=outstanding;
+            }
+            if(!changedThisShow) {++firstChanges;if(firstChanges==5)freezeLeft=64;}
+        }
         if(!changedThisShow) {
             changedThisShow=true;
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-shownSince,&ns);
@@ -323,6 +366,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const uint32_t iova=ok?native_ufs_dpu_map(unsigned(pick),directPages,count):0;
         if(!iova){memory->complete();native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
         surface->retain();memory->retain();
+        native_legacy_dphys[pick]=directPages[0];
         slot={surface,memory,iova,directClock};
         native_legacy_direct[1]=native_legacy_direct[1]+1;
         return pick;
@@ -334,6 +378,33 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         retireSwap(request,true);
         native_legacy_direct[counter]=native_legacy_direct[counter]+1;
     }
+    // True once the GPU wrote everything handed to it before this request arrived (or gave up after 250 ms); otherwise arms the poll.
+    bool gpuWrote(const OriginalLegacySwapRequest *request) {
+        uint32_t submitted=0,retired=0;
+        if(!fenceOn || !&native_adreno_fences || !native_adreno_fences(&submitted,&retired))return true;
+        if(fenceFor!=request) {
+            fenceFor=request;fenceTarget=submitted;fenceSince=0;
+        }
+        if(int32_t(retired-fenceTarget)>=0) {
+            if(fenceSince) {
+                uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-fenceSince,&ns);
+                const uint32_t us=uint32_t(ns/1000);
+                native_legacy_direct[32]=native_legacy_direct[32]+us;
+                if(us>native_legacy_direct[33])native_legacy_direct[33]=us;
+            }
+            fenceFor=nullptr;return true;
+        }
+        if(!fenceSince) {fenceSince=mach_absolute_time();native_legacy_direct[31]=native_legacy_direct[31]+1;}
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-fenceSince,&ns);
+        if(ns>=250000000ull) {
+            native_legacy_direct[34]=native_legacy_direct[34]+1;
+            fenceFor=nullptr;return true;
+        }
+        fenceTimer->setTimeoutUS(200);
+        return false;
+    }
+    static void fenceFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->fenceTick();}
+    void fenceTick() {transferred=false;kickSwapQueue();}
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
     void latchTick() {
         if(!latchRequest)return;
@@ -347,6 +418,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(pendingSlot!=shownSlot)prevSlot=shownSlot;
         shownSlot=pendingSlot;pendingSlot=-1;
         sampleValid=sampleSurface(shownSlot,sampleRef);
+        trace(1,shownSlot);
         changedThisShow=false;if(shownSlot>=0)changedSince[shownSlot]=false;
         shownSince=mach_absolute_time();watchTimer->setTimeoutUS(2000);
         const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
@@ -420,6 +492,7 @@ public:
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
         directToBoot();latchRequest=nullptr;pendingSlot=-1;held=nullptr;
+        if(fenceTimer){fenceTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(fenceTimer);OSSafeReleaseNULL(fenceTimer);}
         if(watchTimer){watchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(watchTimer);OSSafeReleaseNULL(watchTimer);}
         if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
         directOn=false;
@@ -590,9 +663,20 @@ public:
         noteSurface(surface,memory);
         const bool half=nativeHalf(native_legacy_surface_format(surface),native_legacy_surface_planes(surface));
         if(directOn && !half && !gpuBypass && !latchRequest) {
+            if(!gpuWrote(request)) {transferred=true;return;}
             checkShown();
             const int slot=directSlot(surface,memory);
             if(slot>=0) {
+                trace(0,slot);
+                if(shownSlot>=0 && slot!=shownSlot && sampleValid) {
+                    uint32_t fresh[kSampleRows];
+                    if(sampleSurface(slot,fresh)) {
+                        unsigned equal=0;
+                        for(unsigned i=0;i<kSampleRows;++i)if(fresh[i]==sampleRef[i])++equal;
+                        const unsigned at=23+(changedSince[shownSlot]?4:0)+(equal>=63?0:equal>=48?1:equal>=16?2:3);
+                        native_legacy_direct[at]=native_legacy_direct[at]+1;
+                    }
+                }
                 if(changedSince[slot]){native_legacy_direct[19]=native_legacy_direct[19]+1;changedSince[slot]=false;}
                 if(slot==shownSlot)native_legacy_direct[12]=native_legacy_direct[12]+1;
                 else if(slot==prevSlot)native_legacy_direct[13]=native_legacy_direct[13]+1;
