@@ -16,6 +16,11 @@ volatile uint64_t native_gop_gpu_offers,native_gop_gpu_completions,native_gop_gp
 /* waitSwap: [0] calls, [1] timeouts, [2] the requested timeout of the last call (ms), [3] time the last timed-out call really waited (ns), [4] the shortest
  * and [5] the longest such wait (ns), [6] total ns waited in timed-out calls. A timed wait that returns long before its deadline shows here. */
 volatile uint64_t native_gop_wait_stats[7];
+/* The waits that ended without a swap, the newest 64: [0] microseconds since boot at the end, [1] ns waited | wake reason << 56 (0 deadline passed, 1 interrupted,
+ * 2 any other result), [2] the waiting process | swap offered << 32 | swap delivered << 33 | online << 34 | requested timeout in ms << 40. The object waited
+ * on is always the presenter's swap slot. native_gop_wait_reasons: [0] deadline, [1] interrupted, [2] other, [3] woken with a swap. */
+volatile uint64_t native_gop_wait_ring[64][3];volatile uint32_t native_gop_wait_ring_count;volatile uint32_t native_gop_wait_reasons[4];
+int proc_selfpid(void);
 IOService *native_gop_presenter_create(void);
 bool native_gop_gpu_offer(IOService *,void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height,uint32_t format);
 void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
@@ -157,9 +162,19 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     IOLockLock(gate);
     gpuClient=true;
     while(online && (!swap.offered || swap.delivered)) {
-        if(IOLockSleepDeadline(gate,&swap,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {
+        const wait_result_t woke=IOLockSleepDeadline(gate,&swap,deadline,THREAD_ABORTSAFE);
+        if(woke!=THREAD_AWAKENED) {
+            const uint64_t state=(uint64_t)swap.offered<<32|(uint64_t)swap.delivered<<33|(uint64_t)online<<34|timeoutMs<<40;
             IOLockUnlock(gate);
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-began,&ns);
+            const unsigned reason=woke==THREAD_TIMED_OUT?0:woke==THREAD_INTERRUPTED?1:2;
+            native_gop_wait_reasons[reason]=native_gop_wait_reasons[reason]+1;
+            if(ns>=100000000ull) {
+                uint64_t end=0;absolutetime_to_nanoseconds(mach_absolute_time(),&end);
+                const uint32_t n=native_gop_wait_ring_count;volatile uint64_t *at=native_gop_wait_ring[n&63];
+                at[0]=end/1000;at[1]=ns|(uint64_t)reason<<56;at[2]=state|(uint32_t)proc_selfpid();
+                native_gop_wait_ring_count=n+1;
+            }
             native_gop_wait_stats[1]=native_gop_wait_stats[1]+1;native_gop_wait_stats[3]=ns;
             if(!native_gop_wait_stats[4] || ns<native_gop_wait_stats[4])native_gop_wait_stats[4]=ns;
             if(ns>native_gop_wait_stats[5])native_gop_wait_stats[5]=ns;
@@ -168,6 +183,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
         }
     }
     if(!online) {IOLockUnlock(gate);return kIOReturnNotReady;}
+    native_gop_wait_reasons[3]=native_gop_wait_reasons[3]+1;
     swap.delivered=true;
     IOMemoryDescriptor *memory=swap.memory;memory->retain();
     const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height,format=swap.format;
