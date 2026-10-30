@@ -49,8 +49,8 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // (NativeUfs native_ufs_dpu_map). [0] flips, [1] surfaces mapped, [2] map failures, [3] latches that took over 50 ms, [4] longest latch (us),
 // [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory,
 // [9] swaps held back until the GPU had written the frame (the compositor submits the swap when the command buffer is scheduled), [10] total
-// and [11] longest wait (us), [12] waits that gave up after 250 ms.
-extern "C" {volatile uint32_t native_legacy_direct[13];}
+// and [11] longest wait (us), [12] waits that gave up after 250 ms, [13] waits of 8 ms or more (longer than a refresh at 120 Hz: the frame missed a flip).
+extern "C" {volatile uint32_t native_legacy_direct[14];}
 extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired) __attribute__((weak_import));
 // The swap lifecycle: native_legacy_ring holds the newest native_legacy_ring_cap events (allocated at start: a static array of this size no longer fits the kernel's data segment), {[0] microseconds since boot (64 bit), [1] event << 56 | slot + 1 << 48 |
 // swaps validated and not retired << 40 | GPU fences outstanding << 24 | the request's tag (24 bits)}. Events: 1 swap validated, 2 fence wait
@@ -327,6 +327,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
                 const uint32_t us=uint32_t(ns/1000);
                 native_legacy_direct[10]=native_legacy_direct[10]+us;
                 if(us>native_legacy_direct[11])native_legacy_direct[11]=us;
+                if(us>=8000)native_legacy_direct[13]=native_legacy_direct[13]+1;
             }
             fenceFor=nullptr;return true;
         }
