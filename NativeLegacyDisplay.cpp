@@ -52,7 +52,7 @@ extern "C" {volatile uint32_t native_legacy_surfaces[14];}
 // and [11] longest wait (us), [12] waits that gave up after 250 ms.
 extern "C" {volatile uint32_t native_legacy_direct[13];}
 extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired) __attribute__((weak_import));
-// The swap lifecycle: native_legacy_ring holds the newest 256 events, {[0] microseconds since boot (64 bit), [1] event << 56 | slot + 1 << 48 |
+// The swap lifecycle: native_legacy_ring holds the newest native_legacy_ring_cap events (allocated at start: a static array of this size no longer fits the kernel's data segment), {[0] microseconds since boot (64 bit), [1] event << 56 | slot + 1 << 48 |
 // swaps validated and not retired << 40 | GPU fences outstanding << 24 | the request's tag (24 bits)}. Events: 1 swap validated, 2 fence wait
 // begun, 3 fence passed, 4 flipped to a slot, 5 latched, 6 retired, 7 offered to the GPU copy, 8 blank frame. native_legacy_snap is the 64
 // events before the first swap whose validation to flip took over 100 ms (native_legacy_snap_count 1 once taken). native_legacy_swapstat:
@@ -60,7 +60,7 @@ extern "C" bool native_adreno_fences(uint32_t *submitted,uint32_t *retired) __at
 // validated head, [5] direct flips refused for a latch in flight, [6] fence waits begun, [7] swaps that took the copy path, [8] blank frames,
 // [9] flips, [10] latches, [11] retires, [12] validation to flip over 100 ms, [13] the longest (us), [14] their total (us), [15] most swaps
 // validated and not yet retired.
-extern "C" {volatile uint64_t native_legacy_ring[256][2];volatile uint32_t native_legacy_ring_count;volatile uint64_t native_legacy_snap[64][2];volatile uint32_t native_legacy_snap_count;volatile uint32_t native_legacy_swapstat[16];}
+extern "C" {volatile uint64_t (*native_legacy_ring)[2]=nullptr;volatile uint32_t native_legacy_ring_cap=0;volatile uint32_t native_legacy_ring_count;volatile uint64_t native_legacy_snap[64][2];volatile uint32_t native_legacy_snap_count;volatile uint32_t native_legacy_swapstat[16];}
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
 static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
@@ -173,7 +173,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     void note(unsigned event,int slot,const OriginalLegacySwapRequest *request) {
         uint32_t submitted=0,retired=0;uint32_t outstanding=0;
         if(&native_adreno_fences && native_adreno_fences(&submitted,&retired)){const int32_t d=int32_t(submitted-retired);outstanding=d>0?(d>255?255:uint32_t(d)):0;}
-        const uint32_t n=native_legacy_ring_count;volatile uint64_t *at=native_legacy_ring[n&255];
+        if(!native_legacy_ring_cap)return;
+        const uint32_t n=native_legacy_ring_count;volatile uint64_t *at=native_legacy_ring[n&(native_legacy_ring_cap-1)];
         at[0]=nowUs();
         at[1]=uint64_t(event)<<56|uint64_t(slot+1)<<48|uint64_t(validatedCount()&255)<<40|uint64_t(outstanding)<<24|((uintptr_t(request)>>4)&0xffffff);
         native_legacy_ring_count=n+1;
@@ -190,11 +191,11 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(us>native_legacy_swapstat[13])native_legacy_swapstat[13]=uint32_t(us>0xffffffffull?0xffffffffull:us);
         if(us>100000) {
             stat(12);
-            if(!native_legacy_snap_count) {
+            if(!native_legacy_snap_count && native_legacy_ring_cap) {
                 const uint32_t n=native_legacy_ring_count;
                 for(unsigned i=0;i<64;++i) {
                     const uint32_t from=n>=64?n-64+i:i;
-                    native_legacy_snap[i][0]=from<n?native_legacy_ring[from&255][0]:0;native_legacy_snap[i][1]=from<n?native_legacy_ring[from&255][1]:0;
+                    const uint32_t mask=native_legacy_ring_cap-1;native_legacy_snap[i][0]=from<n?native_legacy_ring[from&mask][0]:0;native_legacy_snap[i][1]=from<n?native_legacy_ring[from&mask][1]:0;
                 }
                 native_legacy_snap_count=1;
             }
@@ -448,6 +449,11 @@ public:
     }
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
+        if(!native_legacy_ring) {
+            const uint32_t cap=65536;
+            volatile uint64_t (*memory)[2]=(volatile uint64_t (*)[2])IOMallocZero(sizeof(uint64_t)*2*cap);
+            if(memory) {native_legacy_ring=memory;native_legacy_ring_cap=cap;}
+        }
         if(primary && bootMapping)announcePoweredByFirmware();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
         if(!enabled)return true;
