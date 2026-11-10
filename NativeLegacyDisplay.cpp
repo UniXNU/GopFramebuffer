@@ -148,6 +148,13 @@ static bool convertHalfRows(volatile void *dst,uint64_t dstLength,uint64_t dstSt
     }
     return true;
 }
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
+// macOS: the family's swap-info sender (swap_info_notify_dispatch_gated, bound by the build) and this kernel's own async result
+// sender (protected in IOUserClient.h).
+extern "C" void native_legacy_swap_info_dispatch(void *display,void *blob);
+IOReturn nativeSendAsyncResult(io_user_reference_t *reference,IOReturn result,io_user_reference_t *args,UInt32 count,IOOptionBits options)
+    __asm("__ZN12IOUserClient28sendAsyncResult64WithOptionsEPyiS0_jj");
+#endif
 class NativeLegacyDisplay;
 static NativeLegacyDisplay *gDirectDisplay=nullptr;
 extern "C" void native_legacy_direct_snapshot(void);
@@ -773,15 +780,81 @@ public:
         fenceFor=nullptr;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;traceGpuComplete=false;
         for(auto &entry: validated)entry=nullptr;
         gpuRequest=nullptr;gpuRetired=false;transferred=false;
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
+        // macOS names this slot are_timings_enabled: disp_has_no_clients_gated reprograms the display with a dummy swap when it is
+        // true. The virtual-machine display answers false, as a display with no timing generator does.
+        return false;
+#else
         return true;
+#endif
     }
 #endif
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
+    // macOS: the family calls this slot (notify_swap_done_gated) as the current swap completes. Its swap info goes to the clients
+    // that asked for it (swap_info_notify_dispatch_gated, which calls doSwapInfoNotify per request) unless notifications are held,
+    // then the held ones go first. Layout and words as the virtual-machine display fills them: swap ID, then the family's swap time,
+    // 0, and the swap's two completion words.
+    struct SwapInfo {uint32_t swapID,pad;uint64_t words[5];};
+    static_assert(sizeof(SwapInfo)==48,"IOMobileFramebufferLegacy::SwapInfoBlob");
+    static constexpr unsigned kSwapInfoRing=6;
+    SwapInfo swapInfo[kSwapInfoRing];   // no initializers: IOKit objects are allocated zeroed (see validatedAt)
+    unsigned swapInfoRead,swapInfoWrite;
+    IOReturn collectCompletionReports(uint32_t swapID,void *,uint32_t *,uint32_t) override {
+        auto self=reinterpret_cast<unsigned char *>(this);
+        const unsigned char *swap=nullptr;memcpy(&swap,self+kLegacyCurrentSwap,sizeof(swap));
+        uint32_t dropped=0;
+        if(swap)memcpy(&dropped,swap+kRequestDropReasons,4);
+        if(!swap || dropped)return kIOReturnUnsupported;
+        SwapInfo &info=swapInfo[swapInfoWrite];
+        info={};info.swapID=swapID;
+        memcpy(&info.words[0],self+kLegacySwapInfoTime,8);
+        memcpy(&info.words[2],swap+kRequestSwapInfoA,8);
+        uint32_t second=0;memcpy(&second,swap+kRequestSwapInfoB,4);info.words[3]=second;
+        uint16_t held=0;memcpy(&held,self+kLegacySwapInfoHeld,2);
+        if(held){swapInfoWrite=(swapInfoWrite+1)%kSwapInfoRing;return kIOReturnSuccess;}
+        for(;swapInfoRead!=swapInfoWrite;swapInfoRead=(swapInfoRead+1)%kSwapInfoRing)native_legacy_swap_info_dispatch(this,&swapInfo[swapInfoRead]);
+        native_legacy_swap_info_dispatch(this,&info);
+        return kIOReturnSuccess;
+    }
+    // The client's async result: the mask, the swap ID and each word the mask asks for (word 1 is the time since its previous
+    // notification), as 64-bit values or, with mask bit 31, 32-bit halves; at most 12 values.
+    IOReturn doSwapInfoNotify(void *request,const void *blob) override {
+        auto r=static_cast<unsigned char *>(request);
+        auto info=static_cast<const SwapInfo *>(blob);
+        uint32_t mask=0;memcpy(&mask,r+kNotifyMask,4);
+        uint64_t last=0;memcpy(&last,r+kNotifyLastTime,8);
+        io_user_reference_t args[12]={mask,info->swapID};
+        unsigned count=2;
+        for(unsigned word=0;word<5;++word) {
+            if(!(mask>>word&1))continue;
+            const uint64_t value=word==1?info->words[0]-last:info->words[word];
+            const unsigned need=mask>>31?2:1;
+            if(count+need>12){IOLog("IOMFB Packer put: ran out of space\n");continue;}
+            if(need==2){args[count++]=uint32_t(value);args[count++]=value>>32;}
+            else args[count++]=value;
+        }
+        memcpy(r+kNotifyLastTime,&info->words[0],8);
+        return nativeSendAsyncResult(reinterpret_cast<io_user_reference_t *>(r+kNotifyAsyncReference),kIOReturnSuccess,args,count,
+                                     kIOUserNotifyOptionCanDrop);
+    }
+    // Swap info notifications (type 3) keep their word mask in the request; the display has no other notification type.
+    IOReturn setNotifyTagMaskGated(uint32_t type,void *request,uint32_t mask) override {
+        if(type!=3)return kIOReturnBadArgument;
+        memcpy(static_cast<unsigned char *>(request)+kNotifyMask,&mask,4);return kIOReturnSuccess;
+    }
+    // No factory calibration, frame-info trace or CRC on a GOP scanout.
+    IOReturn factoryPortal(void *,task_t) override {return kIOReturnUnsupported;}
+    IOReturn executeFactoryConfigurations() override {return kIOReturnUnsupported;}
+    IOReturn setFrameInfoNotificationState(void *,bool) override {return kIOReturnSuccess;}
+    IOReturn notifyCrcReady(uint32_t) override {return kIOReturnSuccess;}
+#else
     IOReturn collectCompletionReports(uint32_t,void *,uint32_t *count,uint32_t) override {
         // The original completion helper passes null optional outputs and
         // ignores this IOReturn. GOP exposes no hardware completion telemetry.
         if(count)*count=0;
         return kIOReturnUnsupported;
     }
+#endif
     bool validateSwap(const OriginalLegacySwapRequest *request) override {
         // Qualified original request fields are packed; use memcpy for each
         // access. Accept only one full-frame, untransformed, nonplanar BGRA
