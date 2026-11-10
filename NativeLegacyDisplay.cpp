@@ -20,6 +20,11 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <pexpert/pexpert.h>
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
+#include <IOKit/IODeviceTreeSupport.h>
+#include <libkern/OSKextLib.h>
+#include <kern/thread.h>
+#endif
 extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" bool native_legacy_gop_mapping_observed(IOService *,IOMemoryMap *,uint32_t,uint32_t);
@@ -155,6 +160,21 @@ static bool convertHalfRows(volatile void *dst,uint64_t dstLength,uint64_t dstSt
 extern "C" void native_legacy_swap_info_dispatch(void *display,void *blob);
 IOReturn nativeSendAsyncResult(io_user_reference_t *reference,IOReturn result,io_user_reference_t *args,UInt32 count,IOOptionBits options)
     __asm("__ZN12IOUserClient28sendAsyncResult64WithOptionsEPyiS0_jj");
+// macOS reads the display's modes from its timing and color elements (CoreDisplay, WindowServer): IOAVFamily's constructors, bound
+// by the build (IOAVVideoTimingElement::withData, ::setColorElements, IOAVVideoColorElement::withCapabilities). The enumerations
+// are passed as their integer values.
+extern "C" OSObject *native_legacy_ioav_timing(const void *data,uint32_t standardType,uint32_t timingStandard);
+extern "C" void native_legacy_ioav_timing_colors(OSObject *timing,OSArray *colors);
+// IOMobileFramebufferLegacy::hotPlug_notify(unsigned long long) (macOS): the digital out state IOMobileFramebufferGetDigitalOutState answers.
+extern "C" void native_legacy_hotplug_notify(void *display,uint64_t state);
+// The request fields validateSwap reads (rectangles, layer masks, options, dimensions, surfaces), for the rejection report of the board probe.
+extern "C" const unsigned native_legacy_request_layout[6]={kRequestRect0,kRequestRect1,kRequestMasks,kRequestOptions,kRequestDims,kRequestSurfaces};
+extern "C" OSObject *native_legacy_ioav_color(uint32_t standardType,uint32_t depth,uint32_t encoding,uint32_t range,uint32_t eotf,
+    uint32_t colorimetry,bool,const OSDictionary *,const OSDictionary *,const OSDictionary *,const OSSet *);
+// IOAVElement: its ID (u64) and score (u32); the byte after the score marks an invalid score (IOAVElement::init clears the ID,
+// copyProperties reads all three, hasValidScore tests the byte, 26C5035r).
+static constexpr unsigned kIOAVElementID=16,kIOAVElementScore=24;
+static constexpr uint64_t kDisplayColorID=100,kDisplayTimingID=1000;
 #endif
 class NativeLegacyDisplay;
 static NativeLegacyDisplay *gDirectDisplay=nullptr;
@@ -856,6 +876,7 @@ public:
         return kIOReturnUnsupported;
     }
 #endif
+    bool consoleReleased=false;
     bool validateSwap(const OriginalLegacySwapRequest *request) override {
         // Qualified original request fields are packed; use memcpy for each
         // access. Accept only one full-frame, untransformed, nonplanar BGRA
@@ -906,7 +927,12 @@ public:
                 reason=5;accepted=true;
             }
         }
-        if(accepted){addValidated(request);stat(0);note(1,-1,request);const unsigned depth=validatedCount();if(depth>native_legacy_swapstat[15])native_legacy_swapstat[15]=depth;}
+        if(accepted){
+            // The OS's compositor now owns the panel: the kernel console stops drawing into the framebuffer and stays on the serial
+            // console, as IOFramebuffer does when the window server takes a Mac's display over. With vc-text=1 (text console on the
+            // boot framebuffer), console lines kept landing over the compositor's frames (macOS run35).
+            if(!consoleReleased){consoleReleased=true;PE_initialize_console(nullptr,kPEDisableScreen);}
+            addValidated(request);stat(0);note(1,-1,request);const unsigned depth=validatedCount();if(depth>native_legacy_swapstat[15])native_legacy_swapstat[15]=depth;}
         else removeValidated(request);
         native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;
     }
@@ -957,10 +983,214 @@ public:
                 // The family calls its void slot 316 after startHardware. Our backend supplies the client's default surface.
                 if(valid)valid=installDefaultSurface(width,height);
 #endif
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
+                if(valid && !publishDisplayAttributes(width,height))IOLog("NativeLegacyDisplay: display attributes not published\n");
+                if(valid)publishDisplayContainer(width,height);
+                // The panel is always connected: reported plugged in, as Apple's virtual-machine display does in start_hardware. While the
+                // state stays unplugged, WindowServer keeps this display disabled and composites a virtual main display (macOS-DroidVM).
+                if(valid)native_legacy_hotplug_notify(this,1);
+#endif
             }
         }
         OSSafeReleaseNULL(mapping);return valid;
     }
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
+    static bool putNumber(OSDictionary *d,const char *key,uint64_t value,unsigned bits=32) {
+        OSNumber *n=OSNumber::withNumber(value,bits);bool ok=n && d->setObject(key,n);OSSafeReleaseNULL(n);return ok;
+    }
+    static bool putString(OSDictionary *d,const char *key,const char *value) {
+        OSString *v=OSString::withCString(value);bool ok=v && d->setObject(key,v);OSSafeReleaseNULL(v);return ok;
+    }
+    static OSDictionary *point(uint32_t x,uint32_t y) {
+        OSDictionary *d=OSDictionary::withCapacity(3);
+        if(d && (!putNumber(d,"X",x) || !putNumber(d,"Y",y)))OSSafeReleaseNULL(d);
+        return d;
+    }
+    static bool putPoint(OSDictionary *d,const char *key,uint32_t x,uint32_t y) {
+        OSDictionary *v=point(x,y);bool ok=v && d->setObject(key,v);OSSafeReleaseNULL(v);return ok;
+    }
+    // The display as macOS reads it: one timing element and one color element, the display attributes, the transport and the
+    // source and scaling limits, as the virtual-machine display (AppleParavirtDisplay) publishes them for its single mode.
+    // What is measured: the active size is the GOP mode this backend scans out, the refresh rate is the rate of its own refresh
+    // tick (vsync=, 60 by default). What is derived: the blanking, from the CVT reduced-blanking rule for that size (a GOP display
+    // has no timing generator), and the pixel clock from it. The color element is 8-bit RGB SDR with sRGB chromaticities. The
+    // physical size comes only from the provider's dot pitch; without one it is left out, as no panel size is known here.
+    bool publishDisplayAttributes(uint32_t width,uint32_t height) {
+        unsigned hz=60;PE_parse_boot_argn("vsync",&hz,sizeof(hz));if(!hz || hz>240)hz=60;
+        uint8_t timingData[80]={};
+        uint32_t hTotal=width+160,vTotal=height+23;
+        auto word=[&](unsigned offset,uint32_t value){memcpy(timingData+offset,&value,4);};
+        word(4,hTotal);word(8,width);word(12,32);word(16,80);word(20,48);word(28,1);
+        word(36,vTotal);word(40,height);word(44,6);word(48,14);word(52,3);word(56,hz<<16);
+        word(68,(uint32_t)((uint64_t)hTotal*vTotal*hz));
+        OSObject *timing=native_legacy_ioav_timing(timingData,2,4);
+        OSObject *color=native_legacy_ioav_color(2,8,0,0,0,16,false,nullptr,nullptr,nullptr,nullptr);
+        OSDictionary *attributes=OSDictionary::withCapacity(16),*product=OSDictionary::withCapacity(8),*chromaticity=OSDictionary::withCapacity(3);
+        OSDictionary *white=point(20493,21561),*transport=OSDictionary::withCapacity(2),*source=OSDictionary::withCapacity(5),*scaling=OSDictionary::withCapacity(2);
+        OSArray *colors=OSArray::withCapacity(1),*timings=OSArray::withCapacity(1),*timingColors=OSArray::withCapacity(1);
+        bool done=false;
+        do {
+            if(!timing || !color || !attributes || !product || !chromaticity || !white || !transport || !source || !scaling ||
+               !colors || !timings || !timingColors)break;
+            auto ident=[](OSObject *element,uint64_t id){
+                auto base=reinterpret_cast<uint8_t *>(element);uint32_t score=(uint32_t)id;
+                memcpy(base+kIOAVElementID,&id,8);memcpy(base+kIOAVElementScore,&score,4);
+            };
+            ident(color,kDisplayColorID);ident(timing,kDisplayTimingID);
+            if(!colors->setObject(color) || !timingColors->setObject(color) || !timings->setObject(timing))break;
+            native_legacy_ioav_timing_colors(timing,timingColors);
+            if(!putString(product,"ManufacturerID","UNX") || !putNumber(product,"ProductID",0) || !putNumber(product,"SerialNumber",0) ||
+               !putString(product,"ProductName","UniXNU Display"))break;
+            if(!putPoint(chromaticity,"Red",41943,21627) || !putPoint(chromaticity,"Green",19661,39322) ||
+               !putPoint(chromaticity,"Blue",9830,3932) || !putNumber(white,"Gamma",144179))break;
+            if(!attributes->setObject("SupportsPQEOTF",kOSBooleanFalse) || !attributes->setObject("ProductAttributes",product) ||
+               !attributes->setObject("Chromaticity",chromaticity) || !attributes->setObject("DefaultColorSpaceIsSRGB",kOSBooleanFalse) ||
+               !attributes->setObject("DefaultWhitePoint",white) || !attributes->setObject("SupportsStandby",kOSBooleanTrue) ||
+               !putNumber(attributes,"ContinuousFrequencySupport",3) ||
+               !putNumber(attributes,"NativeFormatHorizontalPixels",width) || !putNumber(attributes,"NativeFormatVerticalPixels",height) ||
+               !putNumber(attributes,"PreciseAspectRatio",((uint64_t)width<<16)/height))break;
+            uint32_t pitch=0;
+            if(getDotPitch(&pitch)==kIOReturnSuccess && pitch) {
+                // Dot pitch in dots per inch; image size in centimetres.
+                if(!putNumber(attributes,"MaxHorizontalImageSize",(width*254ULL/pitch+50)/100) ||
+                   !putNumber(attributes,"MaxVerticalImageSize",(height*254ULL/pitch+50)/100))break;
+            }
+            if(!putString(transport,"Upstream","Other") || !putString(transport,"Downstream","Other"))break;
+            if(!putNumber(source,"MaxSrcBufferWidth",16384) || !putNumber(source,"MaxSrcBufferHeight",16384) ||
+               !putNumber(source,"MaxSrcRectWidth",8192) || !putNumber(source,"MaxSrcRectTotal",0) ||
+               !putNumber(source,"IOMFBMaxCompressedSizeInBytes",0))break;
+            if(!putNumber(scaling,"RGBLayer_MinScaleFraction",4) || !putNumber(scaling,"RGBLayer_MaxScale",4))break;
+            done=setProperty("DisplayAttributes",attributes) && setProperty("Transport",transport) && setProperty("ColorElements",colors) &&
+                 setProperty("TimingElements",timings) && setProperty("IOMFBMaxSrcPixels",source) && setProperty("IOMFBScalingLimits",scaling);
+        } while(false);
+        OSSafeReleaseNULL(attributes);OSSafeReleaseNULL(product);OSSafeReleaseNULL(chromaticity);OSSafeReleaseNULL(white);
+        OSSafeReleaseNULL(transport);OSSafeReleaseNULL(source);OSSafeReleaseNULL(scaling);OSSafeReleaseNULL(colors);
+        OSSafeReleaseNULL(timings);OSSafeReleaseNULL(timingColors);OSSafeReleaseNULL(color);OSSafeReleaseNULL(timing);
+        return done;
+    }
+    // The display's container identifier, as macOS ties a touch screen to its display: WindowServer (WSHIDDisplayEventListener) takes
+    // a digitizer's kUSBContainerID string as a UUID and finds the display whose CoreDisplay container ID equals it
+    // (CGXDisplayDeviceWithContainerID). CoreDisplay reads that ID (IODisplayCreateInfoDictionary, "ContainerID") from the IODisplayEDID of
+    // the first IODisplay at or below the display's service: the Container ID data block (tag 0x29, revision 0, 16 bytes) of a
+    // DisplayID extension (tag 0x70). So a display object of the original IOGraphicsFamily class, never started or registered (no
+    // IOGraphics display behavior), sits below this framebuffer with a 256-byte EDID: a base block describing the scanned-out mode
+    // (the same derived timing as the timing element) and that extension. The touch screen (ShengHidInput) publishes the same UUID.
+    static void containerID(uint8_t uuid[16]) {
+        // FNV-1a of /chosen/unique-chip-id, then of the label; name-based (version 5 bits), RFC 4122 variant. The touch device makes it the
+        // same way (NativeHidInput.cpp); without a chip id both use the label alone.
+        uint64_t seed=0;
+        if(IORegistryEntry *chosen=IORegistryEntry::fromPath("/chosen",gIODTPlane)) {
+            OSData *id=OSDynamicCast(OSData,chosen->getProperty("unique-chip-id"));
+            if(id && id->getLength()>=sizeof(seed))memcpy(&seed,id->getBytesNoCopy(),sizeof(seed));
+            chosen->release();
+        }
+        static const char label[]="builtin-display-container";
+        uint64_t h=0xcbf29ce484222325ull;
+        for(unsigned i=0;i<8;++i)h=(h^((seed>>(8*i))&0xff))*0x100000001b3ull;
+        for(unsigned half=0;half<2;++half) {
+            for(const char *c=label;*c;++c)h=(h^(uint8_t)*c)*0x100000001b3ull;
+            h=(h^half)*0x100000001b3ull;
+            for(unsigned i=0;i<8;++i)uuid[half*8+i]=(uint8_t)(h>>(8*i));
+        }
+        uuid[6]=(uint8_t)((uuid[6]&0x0f)|0x50);uuid[8]=(uint8_t)((uuid[8]&0x3f)|0x80);
+    }
+    void publishDisplayContainer(uint32_t width,uint32_t height) {
+        uint8_t edid[256]={};
+        static const uint8_t header[8]={0x00,0xff,0xff,0xff,0xff,0xff,0xff,0x00};
+        memcpy(edid,header,8);
+        edid[8]=0x55;edid[9]=0xd8;            // manufacturer "UNX", as the display attributes' ManufacturerID
+        edid[10]=0x01;                         // product 1
+        edid[17]=2026-1990;edid[18]=1;edid[19]=4;   // EDID 1.4
+        edid[20]=0xa0;                         // digital, 8 bits per color
+        uint32_t pitch=0;
+        uint32_t widthMm=0,heightMm=0;
+        if(getDotPitch(&pitch)==kIOReturnSuccess && pitch){widthMm=(uint32_t)(width*254ULL/pitch/10);heightMm=(uint32_t)(height*254ULL/pitch/10);}
+        edid[21]=(uint8_t)((widthMm+5)/10>255?255:(widthMm+5)/10);edid[22]=(uint8_t)((heightMm+5)/10>255?255:(heightMm+5)/10);
+        edid[23]=120;                          // gamma 2.2
+        edid[24]=0x02;                         // RGB 4:4:4; the preferred timing is the native mode
+        static const uint8_t srgb[10]={0xee,0x91,0xa3,0x54,0x4c,0x99,0x26,0x0f,0x50,0x54};
+        memcpy(edid+25,srgb,10);
+        for(unsigned i=38;i<54;++i)edid[i]=0x01;   // no standard timings
+        // Detailed timing: the derived reduced-blanking timing of publishDisplayAttributes (blanking 160 x 23, sync 32 x 6, front 48 x 3).
+        unsigned hz=60;PE_parse_boot_argn("vsync",&hz,sizeof(hz));if(!hz || hz>240)hz=60;
+        const uint32_t hBlank=160,vBlank=23,hFront=48,hSync=32,vFront=3,vSync=6;
+        uint64_t clock=(uint64_t)(width+hBlank)*(height+vBlank)*hz/10000;if(clock>0xffff)clock=0xffff;
+        uint8_t *d=edid+54;
+        d[0]=(uint8_t)clock;d[1]=(uint8_t)(clock>>8);
+        d[2]=(uint8_t)width;d[3]=(uint8_t)hBlank;d[4]=(uint8_t)(((width>>8)&0xf)<<4|((hBlank>>8)&0xf));
+        d[5]=(uint8_t)height;d[6]=(uint8_t)vBlank;d[7]=(uint8_t)(((height>>8)&0xf)<<4|((vBlank>>8)&0xf));
+        d[8]=(uint8_t)hFront;d[9]=(uint8_t)hSync;d[10]=(uint8_t)((vFront&0xf)<<4|(vSync&0xf));d[11]=0;
+        d[12]=(uint8_t)widthMm;d[13]=(uint8_t)heightMm;d[14]=(uint8_t)(((widthMm>>8)&0xf)<<4|((heightMm>>8)&0xf));
+        d[17]=0x1a;                            // digital separate sync, h- v+ (CVT reduced blanking)
+        static const uint8_t name[18]={0,0,0,0xfc,0,'U','n','i','X','N','U','\n',' ',' ',' ',' ',' ',' '};
+        memcpy(edid+72,name,18);
+        for(unsigned at=90;at<126;at+=18)edid[at+3]=0x10;   // dummy descriptors
+        edid[126]=1;
+        uint8_t *x=edid+128;
+        x[0]=0x70;x[1]=0x20;x[2]=19;x[3]=0;x[4]=0;   // DisplayID 2.0 section: 19 bytes of data blocks
+        x[5]=0x29;x[6]=0;x[7]=16;containerID(x+8);
+        unsigned sum=0;for(unsigned i=1;i<24;++i)sum+=x[i];x[24]=(uint8_t)(0x100-(sum&0xff));
+        for(unsigned block=0;block<2;++block) {
+            unsigned total=0;for(unsigned i=0;i<127;++i)total+=edid[block*128+i];edid[block*128+127]=(uint8_t)(0x100-(total&0xff));
+        }
+        // The display's UUID, read by QuartzCore's IOMFB display (IOMobileFramebufferCopyProperty "IOMFBUUID", a string) before it makes
+        // one up. WindowServer ties a touch screen to the display whose UUID is the digitizer's "displayUUID" property
+        // (WSHIDDisplayEventListener::handle_digitizer_added; macOS run41: "no usable displayUUID property; treating as no digitizer
+        // added"), so the framebuffer gives the one the touch device publishes: the container UUID.
+        {
+            uint8_t u[16];containerID(u);char text[37];
+            snprintf(text,sizeof(text),"%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",u[0],u[1],u[2],u[3],u[4],u[5],u[6],u[7],
+                     u[8],u[9],u[10],u[11],u[12],u[13],u[14],u[15]);
+            setProperty("IOMFBUUID",text);
+        }
+        OSData *data=OSData::withBytes(edid,sizeof(edid));
+        if(!data)return;
+        setProperty("NativeDisplayEDID",data);   // kept for the worker below, which attaches the display object
+        data->release();
+        retain();
+        thread_t thread=nullptr;
+        if(kernel_thread_start(attachDisplayObject,this,&thread)==KERN_SUCCESS)thread_deallocate(thread);
+        else release();
+    }
+    // The IODisplay class is IOGraphicsFamily's, loaded here if nothing has loaded it yet (outside the framebuffer's start).
+    static void attachDisplayObject(void *context,wait_result_t) {
+        NativeLegacyDisplay *self=static_cast<NativeLegacyDisplay *>(context);
+        const OSReturn loaded=OSKextLoadKextWithIdentifier("com.apple.iokit.IOGraphicsFamily");
+        OSObject *object=(loaded==kOSReturnSuccess || loaded==kOSKextReturnStartStopError)?OSMetaClass::allocClassWithName("IODisplay"):nullptr;
+        IOService *display=OSDynamicCast(IOService,object);
+        OSData *edid=OSDynamicCast(OSData,self->getProperty("NativeDisplayEDID"));
+        bool attached=false;
+        if(display && edid && display->init()) {
+            const uint8_t *bytes=static_cast<const uint8_t *>(edid->getBytesNoCopy());
+            display->setProperty("IODisplayEDID",edid);
+            display->setProperty("DisplayVendorID",(unsigned long long)(bytes[8]<<8|bytes[9]),32);
+            display->setProperty("DisplayProductID",(unsigned long long)(bytes[10]|bytes[11]<<8),32);
+            display->setName("NativeDisplay");
+            attached=display->attach(self);
+        }
+        IOLog("NativeLegacyDisplay: display object %s (kext %d)\n",attached?"attached":"not attached",(int)loaded);
+        OSSafeReleaseNULL(object);
+        self->release();
+        thread_terminate(current_thread());
+    }
+    // Family slots whose IOMobileFramebufferLegacy code answers kIOReturnUnsupported and that macOS's display clients call to bring
+    // the display up, implemented as the virtual-machine display does. The mode is the one color and timing element published
+    // above; the active size stays the GOP mode the backend scans out.
+    uint32_t colorRemapMode=6;   // what the family's get_color_remap_mode answers before any change
+    IOReturn setDigitalOutMode(uint32_t colorID,uint32_t timingID) override {
+        if(colorID!=kDisplayColorID || timingID!=kDisplayTimingID)return kIOReturnBadArgument;
+        uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
+        setProperty("DisplayWidth",width,32);setProperty("DisplayHeight",height,32);setProperty("DPTimingModeId",timingID,32);
+        return kIOReturnSuccess;
+    }
+    IOReturn setDisplayDevice(uint32_t) override {return kIOReturnSuccess;}
+    // No gamma hardware: the scanout is the surface as given. The family's get_gamma_table keeps answering unsupported.
+    IOReturn setGammaTable(void *) override {return kIOReturnSuccess;}
+    IOReturn setColorRemapMode(uint32_t mode) override {colorRemapMode=mode;return kIOReturnSuccess;}
+    IOReturn getColorRemapMode(uint32_t *mode) override {if(!mode)return kIOReturnBadArgument;*mode=colorRemapMode;return kIOReturnSuccess;}
+    // No color matrix hardware either; the compositor's matrix is accepted, as the virtual-machine display accepts it.
+    IOReturn swapSetColorMatrix(void *,uint32_t,uint32_t) override {return kIOReturnSuccess;}
+#endif
 #define LEAF(n) __attribute__((noreturn,noinline)) void opaque##n() override { native_legacy_backend_guard(n,this,__builtin_return_address(0)); }
     NATIVE_LEGACY_LEAVES(LEAF)
 #undef LEAF
