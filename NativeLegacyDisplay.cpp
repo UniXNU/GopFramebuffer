@@ -10,6 +10,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
