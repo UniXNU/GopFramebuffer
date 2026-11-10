@@ -39,7 +39,7 @@ class NativeGOPPresenter : public IOService {
     NGPMode mode={};
     bool online=false;
     IOService *memorySource=nullptr;
-    // GPU hand-off (sheng-fb-gpu=1): one offered frame at a time, from the display driver to the privileged client.
+    // GPU hand-off (fb-gpu=1): one offered frame at a time, from the display driver to the privileged client.
     bool gpuMode=false,gpuClient=false;
     struct {bool offered,delivered;uint64_t sequence;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;
             uint64_t stride;uint32_t width,height,format;} swap={};
@@ -104,7 +104,7 @@ bool NativeGOPPresenter::start(IOService *provider) {
     if(!mapping || !mapping->getVirtualAddress() || mapping->getPhysicalAddress()!=video.v_baseAddr ||
        mapping->getLength()!=video.v_rowBytes*video.v_height)return false;
     gate=IOLockAlloc();if(!gate)return false;
-    {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
+    {unsigned v=0;PE_parse_boot_argn("fb-gpu",&v,sizeof v);gpuMode=(v==1);}
     mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
     native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
     online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
