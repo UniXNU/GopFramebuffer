@@ -4,6 +4,8 @@ UEFI GOP framebuffer and MobileFramebuffer integration.
 
 CPU and GPU scanout are supported. With `vsync=<Hz>`, a work-loop timer sends the MobileFramebuffer vsync message to the compositor.
 
+Swaps carry one full-screen surface: 8-bit BGRA, plain or in the one-plane compressed spelling, or half-float RGBA. With `dpu-scanout=2` the display pipes fetch an 8-bit surface themselves. A half-float surface cannot be fetched: the GPU client converts it into the scanout memory (`fb-gpu=1`), or the CPU does when no client takes it. `fb-half=2` reads half-float values as already encoded. A render server that takes the device for a virtual machine presents half float. `native_legacy_formats` counts the swaps of each format, the swaps refused for their format and the frames on each path.
+
 Direct display keeps the first successful GPU fence snapshot for each swap. Busy or unavailable queries retry after 200 microseconds. Reaching 250 milliseconds records a slow wait; the current frame stays on screen until the target completes or the display family cancels the swap. Cancellation clears the pending fence timer and snapshot.
 
 Run the fence-wait regression check with `python3 Test/check-fence-wait.py`. It compiles the display's fence-wait and cancellation methods against a simulated GPU with AddressSanitizer and UndefinedBehaviorSanitizer.

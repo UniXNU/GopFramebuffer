@@ -71,6 +71,13 @@ extern "C" bool native_adreno_fences_detail(uint32_t *,uint32_t *,uint32_t *) __
 // validated and not yet retired.
 extern "C" {volatile uint64_t native_legacy_center_half[2];}
 extern "C" {volatile uint64_t (*native_legacy_ring)[2]=nullptr;volatile uint32_t native_legacy_ring_cap=0;volatile uint32_t native_legacy_ring_count;volatile uint64_t native_legacy_snap[64][2];volatile uint32_t native_legacy_snap_count;volatile uint32_t native_legacy_swapstat[16];}
+// What the compositor presents and where each frame goes: swaps accepted with [0] plain 'BGRA', [1] one-plane compressed '&BGA', [2] half-float
+// 'RGhA'; [3] swaps refused for the surface's format and [4] that format (the last one); frames [5] the display pipes fetch themselves (8-bit
+// only), handed to the GPU client as [6] 8-bit and [7] half float, converted by the CPU as [8] 8-bit and [9] half float. A render server
+// that takes the device for a virtual machine draws half float (QuartzCore's IOMFBDisplay::framebuffer_pixel_format), which the display pipes
+// cannot fetch: every such frame costs one more full-screen pass.
+extern "C" {volatile uint32_t native_legacy_formats[10];}
+static inline void countFormat(unsigned index) {native_legacy_formats[index]=native_legacy_formats[index]+1;}
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
 static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
@@ -677,7 +684,7 @@ public:
             if(slot>=0) {
                 native_legacy_swap_stage(1);
                 flip(directSlots[slot].iova,uint32_t(sourceStride));directBoot=false;
-                native_legacy_direct[0]=native_legacy_direct[0]+1;
+                native_legacy_direct[0]=native_legacy_direct[0]+1;countFormat(5);
                 stat(9);note(4,slot,request);noteFlipDelay(request);
                 shadowValid=false;pendingSlot=slot;latchRequest=request;transferred=true;
                 latchStart=mach_absolute_time();latchTimer->setTimeoutUS(500);
@@ -689,7 +696,7 @@ public:
         stat(7);note(7,-1,request);
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height,half?halfOfferFormat():NGP_BGRX8888)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
-            native_legacy_swap_stage(1);
+            native_legacy_swap_stage(1);countFormat(half?7:6);
             shadowValid=false;gpuRequest=request;gpuTraceRequest=traceId(request);gpuLength=length;transferred=true;
             // The compositor renders the next frame only after this swap retires, so retiring at the end of the copy serialized render and
             // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
@@ -717,7 +724,7 @@ public:
             }
             __asm__ volatile("dsb sy" ::: "memory");
             {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,length);}
-            shadowValid=false;OSSafeReleaseNULL(source);transferred=true;
+            shadowValid=false;OSSafeReleaseNULL(source);transferred=true;countFormat(9);
             native_legacy_transfer_observed(kIOReturnSuccess,request,length);
             finishTransfer(request);
             return;
@@ -758,7 +765,7 @@ public:
         }
         __asm__ volatile("dsb sy" ::: "memory");
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
-        OSSafeReleaseNULL(source);transferred=true;
+        OSSafeReleaseNULL(source);transferred=true;countFormat(8);
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
         finishTransfer(request);
     }
@@ -920,13 +927,16 @@ public:
                     IOMemoryDescriptor *memory=native_legacy_surface_descriptor(surface);
                     // A surface larger than the display (rows or lines padded to the GPU's alignment) is accepted: only the visible rectangle,
                     // which the request's rectangles already name as the whole display, is copied.
+                    const uint32_t format=native_legacy_surface_format(surface),planes=native_legacy_surface_planes(surface);
                     if(native_legacy_surface_width(surface)>=width && native_legacy_surface_height(surface)>=height &&
-                       nativeScanoutFormat(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) &&
+                       nativeScanoutFormat(format,planes) &&
                        memory && memory->metaCast("IOMemoryDescriptor") &&
                        native_legacy_surface_bounds(width,height,native_legacy_surface_stride(surface),
                            native_legacy_surface_allocation(surface),memory->getLength())) {
                         reason=0;accepted=true;
+                        countFormat(nativeHalf(format,planes)?2:format==0x26424741?1:0);
                     } else {
+                        if(!nativeScanoutFormat(format,planes)) {countFormat(3);native_legacy_formats[4]=format;}
                         native_legacy_surface_rejected(native_legacy_surface_width(surface),native_legacy_surface_height(surface),
                             native_legacy_surface_format(surface),native_legacy_surface_planes(surface),native_legacy_surface_stride(surface),
                             native_legacy_surface_allocation(surface),memory?memory->getLength():0);
