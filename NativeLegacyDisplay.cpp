@@ -876,7 +876,9 @@ public:
         return kIOReturnUnsupported;
     }
 #endif
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
     bool consoleReleased=false;
+#endif
     bool validateSwap(const OriginalLegacySwapRequest *request) override {
         // Qualified original request fields are packed; use memcpy for each
         // access. Accept only one full-frame, untransformed, nonplanar BGRA
@@ -931,7 +933,9 @@ public:
             // The OS's compositor now owns the panel: the kernel console stops drawing into the framebuffer and stays on the serial
             // console, as IOFramebuffer does when the window server takes a Mac's display over. With vc-text=1 (text console on the
             // boot framebuffer), console lines kept landing over the compositor's frames (macOS run35).
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
             if(!consoleReleased){consoleReleased=true;PE_initialize_console(nullptr,kPEDisableScreen);}
+#endif
             addValidated(request);stat(0);note(1,-1,request);const unsigned depth=validatedCount();if(depth>native_legacy_swapstat[15])native_legacy_swapstat[15]=depth;}
         else removeValidated(request);
         native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;
