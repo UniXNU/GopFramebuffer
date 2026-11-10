@@ -69,6 +69,7 @@ extern "C" bool native_adreno_fences_detail(uint32_t *,uint32_t *,uint32_t *) __
 // validated head, [5] direct flips refused for a latch in flight, [6] fence waits begun, [7] swaps that took the copy path, [8] blank frames,
 // [9] flips, [10] latches, [11] retires, [12] validation to flip over 100 ms, [13] the longest (us), [14] their total (us), [15] most swaps
 // validated and not yet retired.
+extern "C" {volatile uint64_t native_legacy_center_half[2];}
 extern "C" {volatile uint64_t (*native_legacy_ring)[2]=nullptr;volatile uint32_t native_legacy_ring_cap=0;volatile uint32_t native_legacy_ring_count;volatile uint64_t native_legacy_snap[64][2];volatile uint32_t native_legacy_snap_count;volatile uint32_t native_legacy_swapstat[16];}
 extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
 extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
@@ -655,6 +656,20 @@ public:
         }
         noteSurface(surface,memory);
         const bool half=nativeHalf(native_legacy_surface_format(surface),native_legacy_surface_planes(surface));
+        if(half) {
+            // Every 32nd half-float frame: the centre pixel's four raw components and the sample count, for the boot log. They tell
+            // whether a compositor writes linear or encoded values (a mid grey is 0.214 linear and 0.5 encoded).
+            static uint32_t tick;
+            if((tick++&31)==0) {
+                uint16_t pixel[4]={};
+                IOMemoryDescriptor *descriptor=OSDynamicCast(IOMemoryDescriptor,memory);
+                const uint64_t offset=(uint64_t)(height/2)*sourceStride+(uint64_t)(width/2)*8;
+                if(descriptor && offset+8<=descriptor->getLength() && descriptor->readBytes(offset,pixel,8)==8) {
+                    native_legacy_center_half[0]=(uint64_t)pixel[0]|(uint64_t)pixel[1]<<16|(uint64_t)pixel[2]<<32|(uint64_t)pixel[3]<<48;
+                    native_legacy_center_half[1]=native_legacy_center_half[1]+1;
+                }
+            }
+        }
         if(directOn && !half && !gpuBypass && latchRequest)stat(5);
         if(directOn && !half && !gpuBypass && !latchRequest) {
             if(!gpuWrote(request)) {transferred=true;return;}
