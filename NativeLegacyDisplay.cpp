@@ -408,7 +408,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             fenceSlow=true;
         }
         gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),known?3:4,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
-        fenceTimer->setTimeoutUS(200);
+        fenceTimer->setTimeoutUS(100);
         return false;
     }
     static void fenceFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->fenceTick();}
@@ -418,7 +418,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!latchRequest)return;
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
         gpuTraceEvent(GpuTraceDisplayLatch,0,traceId(latchRequest),mdp[kCtlFlush/4],ns,shownSlot,pendingSlot);
-        if((mdp[kCtlFlush/4]&0x3) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
+        if((mdp[kCtlFlush/4]&0x3) && ns<50000000ull){latchTimer->setTimeoutUS(200);return;}
         if(ns>=50000000ull)native_legacy_direct[3]=native_legacy_direct[3]+1;
         const uint32_t us=uint32_t(ns/1000);
         if(us>native_legacy_direct[4])native_legacy_direct[4]=us;
@@ -687,7 +687,7 @@ public:
                 native_legacy_direct[0]=native_legacy_direct[0]+1;countFormat(5);
                 stat(9);note(4,slot,request);noteFlipDelay(request);
                 shadowValid=false;pendingSlot=slot;latchRequest=request;transferred=true;
-                latchStart=mach_absolute_time();latchTimer->setTimeoutUS(500);
+                latchStart=mach_absolute_time();latchTimer->setTimeoutUS(200);
                 return;
             }
             native_legacy_direct[7]=native_legacy_direct[7]+1;
