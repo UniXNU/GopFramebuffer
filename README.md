@@ -10,6 +10,8 @@ Direct display keeps the first successful GPU fence snapshot for each swap. Busy
 
 Run the fence-wait regression check with `python3 Test/check-fence-wait.py`. It compiles the display's fence-wait and cancellation methods against a simulated GPU with AddressSanitizer and UndefinedBehaviorSanitizer.
 
+On macOS the first accepted swap hands the panel over: the kernel's progress meter is stopped, then its console is paused. The meter is the bar the kernel draws low on the screen from the moment it takes the display; left running, its timer keeps drawing into the boot framebuffer for about 24 minutes, and a blank frame in that time (the display asleep) shows the pieces drawn after it. `sysctl kern.progressmeterenable` reads 0 once the compositor has the panel. Run the check with `python3 Test/check-console-handoff.py`.
+
 Build and interface details: [documentation](https://unixnu.com/drivers/gop-framebuffer). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
 
 ## Frame diagnostics

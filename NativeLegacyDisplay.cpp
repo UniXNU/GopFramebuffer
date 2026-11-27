@@ -33,6 +33,9 @@ extern "C" void native_legacy_swap_stage(unsigned);
 extern "C" void native_legacy_client_enter(task_t,uint32_t);
 extern "C" void native_legacy_client_observed(IOReturn,IOUserClient *);
 extern "C" void native_legacy_pm_observed(unsigned,IOReturn,unsigned long);
+#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
+extern "C" void vc_progress_set(boolean_t enable,uint32_t vc_delay);   // osfmk/console/video_console.h
+#endif
 extern "C" IOMemoryDescriptor *native_legacy_surface_descriptor(OSObject *);
 extern "C" uint64_t native_legacy_surface_width(OSObject *),native_legacy_surface_height(OSObject *);
 extern "C" uint64_t native_legacy_surface_stride(OSObject *),native_legacy_surface_allocation(OSObject *);
@@ -900,6 +903,20 @@ public:
 #endif
 #if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
     bool consoleReleased=false;
+    // The OS's compositor now owns the panel: the kernel console stops drawing into the framebuffer and stays on the serial
+    // console, as IOFramebuffer does when the window server takes a Mac's display over. With vc-text=1 (text console on the
+    // boot framebuffer), console lines kept landing over the compositor's frames (macOS run35).
+    // The kernel's progress meter goes first. macOS starts it when the kernel takes the screen at boot, and its timer draws the
+    // next piece of the bar (low on the screen, up to the middle) into the boot framebuffer every 125 ms for about 24 minutes;
+    // pausing the console stops neither (vc_progressmeter_task looks at the meter only). A display that went to sleep in that
+    // time, which blanks the boot framebuffer and shows it, got a white mark that grew at the bottom centre (kern.progressmeterenable
+    // still read 3 an hour and a half after boot). Stopped before the pause, the kernel also cancels the timer.
+    void handOffConsole() {
+        if(consoleReleased)return;
+        consoleReleased=true;
+        vc_progress_set(FALSE,0);
+        PE_initialize_console(nullptr,kPEDisableScreen);
+    }
 #endif
     bool validateSwap(const OriginalLegacySwapRequest *request) override {
         // Qualified original request fields are packed; use memcpy for each
@@ -955,11 +972,8 @@ public:
             }
         }
         if(accepted){
-            // The OS's compositor now owns the panel: the kernel console stops drawing into the framebuffer and stays on the serial
-            // console, as IOFramebuffer does when the window server takes a Mac's display over. With vc-text=1 (text console on the
-            // boot framebuffer), console lines kept landing over the compositor's frames (macOS run35).
 #if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS
-            if(!consoleReleased){consoleReleased=true;PE_initialize_console(nullptr,kPEDisableScreen);}
+            handOffConsole();
 #endif
             addValidated(request);stat(0);note(1,-1,request);const unsigned depth=validatedCount();if(depth>native_legacy_swapstat[15])native_legacy_swapstat[15]=depth;}
         else removeValidated(request);
